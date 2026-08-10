@@ -12,12 +12,15 @@ stale relative to a value move (the adverse-selection mechanic).
 
 Two bots are compared on the same price path (same seed):
   - NaiveBot: fixed-width spread around last trade price, no skew.
-  - SkewBot:  inventory-skewed quotes + a hard position kill-switch.
+  - SkewBot:  inventory-skewed quotes + a hard position kill-switch +
+              a microprice-style fair value (EWMA tilted by recent
+              order-flow imbalance) instead of raw last-trade.
 
 Levers this exercises, per prep_tracker checklist: spread width,
 inventory skew, fair-value estimation, risk-first ordering.
 """
 import random
+from collections import deque
 from dataclasses import dataclass, field
 
 
@@ -93,27 +96,50 @@ class NaiveBot:
     def quote(self, inventory):
         return self.last_price - self.half_spread, self.last_price + self.half_spread
 
-    def on_fill(self, price):
+    def on_fill(self, price, side):
         self.last_price = price
 
 
 class SkewBot:
-    """Inventory-skewed quotes + hard position cap (kill-switch first)."""
+    """Inventory-skewed quotes + hard position cap (kill-switch first) +
+    a microprice-style fair value instead of raw last-trade.
+
+    No real order book is visible in this sim (bots only see their own
+    fills), so "microprice" here is approximated as an EWMA of trade
+    price tilted by recent order-flow imbalance — the prep doc's stated
+    fallback ("microprice or order-flow-imbalance weighted mid, not the
+    naive mid"). Heavy recent hits on the ask (aggressive buying) pull
+    fair value up toward the ask; heavy hits on the bid pull it down.
+    Swap for a literal book-depth microprice once Akuna's real feed
+    exposes bid/ask sizes.
+    """
 
     name = "skew"
 
-    def __init__(self, half_spread=0.5, max_pos=10, skew_per_unit=0.04):
+    def __init__(self, half_spread=0.5, max_pos=10, skew_per_unit=0.04,
+                 ewma_alpha=0.15, flow_window=20, imbalance_sensitivity=0.3):
         self.half_spread = half_spread
         self.max_pos = max_pos
         self.skew_per_unit = skew_per_unit
-        self.last_price = 100.0
+        self.ewma_alpha = ewma_alpha
+        self.imbalance_sensitivity = imbalance_sensitivity
+        self.fair_value = 100.0
+        self.recent_fills = deque(maxlen=flow_window)  # "buy"/"sell", bot's side
+
+    def _microprice(self):
+        ask_hits = self.recent_fills.count("sell")  # bot sold -> buyer aggression
+        bid_hits = self.recent_fills.count("buy")   # bot bought -> seller aggression
+        total = ask_hits + bid_hits
+        imbalance = (ask_hits - bid_hits) / total if total else 0.0
+        return self.fair_value + imbalance * self.imbalance_sensitivity
 
     def quote(self, inventory):
         # Shade quotes against the direction of existing inventory so the
         # bot gets lifted/hit more on the reducing side (rung 1: risk first).
         skew = -inventory * self.skew_per_unit
-        bid = self.last_price - self.half_spread + skew
-        ask = self.last_price + self.half_spread + skew
+        fv = self._microprice()
+        bid = fv - self.half_spread + skew
+        ask = fv + self.half_spread + skew
         # Kill-switch: at the cap, stop quoting the side that would extend it.
         if inventory >= self.max_pos:
             bid = None
@@ -121,8 +147,9 @@ class SkewBot:
             ask = None
         return bid, ask
 
-    def on_fill(self, price):
-        self.last_price = price
+    def on_fill(self, price, side):
+        self.fair_value += self.ewma_alpha * (price - self.fair_value)
+        self.recent_fills.append(side)
 
 
 def run(bot, true_path: TrueValuePath, flow: Flow, ticks: int) -> BotResult:
@@ -143,12 +170,12 @@ def run(bot, true_path: TrueValuePath, flow: Flow, ticks: int) -> BotResult:
                 result.cash += ask * size
                 result.inventory -= size
                 result.fills.append(Fill(t, "sell", ask, size))
-                bot.on_fill(ask)
+                bot.on_fill(ask, "sell")
             elif side == "sell" and bid is not None:
                 result.cash -= bid * size
                 result.inventory += size
                 result.fills.append(Fill(t, "buy", bid, size))
-                bot.on_fill(bid)
+                bot.on_fill(bid, "buy")
 
         result.max_abs_inventory = max(result.max_abs_inventory, abs(result.inventory))
         result.pnl_history.append(result.mark_to_market(true_next))
