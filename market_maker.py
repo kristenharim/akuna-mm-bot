@@ -14,7 +14,9 @@ Two bots are compared on the same price path (same seed):
   - NaiveBot: fixed-width spread around last trade price, no skew.
   - SkewBot:  inventory-skewed quotes + a hard position kill-switch +
               a microprice-style fair value (EWMA tilted by recent
-              order-flow imbalance) instead of raw last-trade.
+              order-flow imbalance) instead of raw last-trade + a
+              volatility-scaled spread (widens when recent moves are
+              large, capped so it can't runaway-widen itself).
 
 Levers this exercises, per prep_tracker checklist: spread width,
 inventory skew, fair-value estimation, risk-first ordering.
@@ -116,14 +118,23 @@ class SkewBot:
 
     name = "skew"
 
-    def __init__(self, half_spread=0.5, max_pos=10, skew_per_unit=0.04,
-                 ewma_alpha=0.15, flow_window=20, imbalance_sensitivity=0.3):
-        self.half_spread = half_spread
+    def __init__(self, base_half_spread=0.4, max_pos=10, skew_per_unit=0.04,
+                 ewma_alpha=0.15, flow_window=20, imbalance_sensitivity=0.3,
+                 vol_alpha=0.1, vol_multiplier=3.0, max_half_spread=1.2):
+        self.base_half_spread = base_half_spread
         self.max_pos = max_pos
         self.skew_per_unit = skew_per_unit
         self.ewma_alpha = ewma_alpha
         self.imbalance_sensitivity = imbalance_sensitivity
+        self.vol_alpha = vol_alpha
+        self.vol_multiplier = vol_multiplier
+        # ponytail: hard cap on quoted spread. Without it, a wide spread pushes
+        # fill prices away from fair value -> vol estimate reads that as more
+        # volatility -> spread widens further -> runaway. Real desks cap max
+        # spread for the same reason; raise this if legitimate vol needs more.
+        self.max_half_spread = max_half_spread
         self.fair_value = 100.0
+        self.vol_ewma = 0.0  # EWMA of |fair value change| per fill, a volatility proxy
         self.recent_fills = deque(maxlen=flow_window)  # "buy"/"sell", bot's side
 
     def _microprice(self):
@@ -138,8 +149,14 @@ class SkewBot:
         # bot gets lifted/hit more on the reducing side (rung 1: risk first).
         skew = -inventory * self.skew_per_unit
         fv = self._microprice()
-        bid = fv - self.half_spread + skew
-        ask = fv + self.half_spread + skew
+        # Widen when recent moves have been large, tighten when calm — the
+        # prep doc's "widen when volatility rises or confidence drops."
+        half_spread = min(
+            self.base_half_spread + self.vol_multiplier * self.vol_ewma,
+            self.max_half_spread,
+        )
+        bid = fv - half_spread + skew
+        ask = fv + half_spread + skew
         # Kill-switch: at the cap, stop quoting the side that would extend it.
         if inventory >= self.max_pos:
             bid = None
@@ -148,7 +165,14 @@ class SkewBot:
         return bid, ask
 
     def on_fill(self, price, side):
-        self.fair_value += self.ewma_alpha * (price - self.fair_value)
+        # Volatility proxy = the size of the step our own estimate takes, not
+        # the raw (price - fair_value) gap — that gap structurally includes
+        # our own quoted spread, which would bias "volatility" upward by
+        # however wide we're quoting and feed the widen->bias->widen loop
+        # the spread cap above guards against.
+        increment = self.ewma_alpha * (price - self.fair_value)
+        self.fair_value += increment
+        self.vol_ewma += self.vol_alpha * (abs(increment) - self.vol_ewma)
         self.recent_fills.append(side)
 
 
@@ -176,6 +200,10 @@ def run(bot, true_path: TrueValuePath, flow: Flow, ticks: int) -> BotResult:
                 result.inventory += size
                 result.fills.append(Fill(t, "buy", bid, size))
                 bot.on_fill(bid, "buy")
+            # Re-quote off the post-fill inventory before the next event in
+            # this tick, so a kill-switch cap can't be blown past by a second
+            # same-tick fill landing before the bot ever saw the new position.
+            bid, ask = bot.quote(result.inventory)
 
         result.max_abs_inventory = max(result.max_abs_inventory, abs(result.inventory))
         result.pnl_history.append(result.mark_to_market(true_next))

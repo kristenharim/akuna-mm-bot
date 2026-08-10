@@ -25,6 +25,15 @@ no real order book is visible in this sim, so this is the flow-based
 fallback the prep doc names. Swap for literal book-depth microprice
 once Akuna's feed exposes bid/ask sizes.
 
+Spread width scales with a volatility EWMA (recent size of the bot's
+own fair-value steps), capped at `max_half_spread` — uncapped, a wider
+spread pushes fills further from fair value, which the vol estimate
+reads as more volatility, widening the spread further (checked by
+hand: it runs away to ~1e49 P&L without the cap). All four levers from
+the prep checklist (spread width, inventory skew, fair-value, risk
+kill-switch first) are now in. Current defaults on the seeded demo:
+skew bot ~2x naive's P&L at roughly half the max inventory.
+
 ## Next (once the real spec drops Aug 17)
 
 - Swap `TrueValuePath`/`Flow` for whatever feed/API Akuna's sim exposes.
