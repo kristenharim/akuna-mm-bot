@@ -1,8 +1,8 @@
 # akuna-mm-bot
 
-Throwaway market-making sim, built as prep for the [Akuna Capital 2026
+Market-making simulator, built as prep for the [Akuna Capital 2026
 Virtual Quant Trading Challenge](https://akunacapital.com/careers/job/7993921/akuna-capitals-2026-virtual-quant-trading-challenge/?gh_jid=7993921)
-(Aug 17-21, 2026). Doubles as prep-tracker credential #2.
+(Aug 17-21, 2026).
 
 Not Akuna's actual harness — that's unpublished until day 1 of the
 challenge. This is a generic continuous-double-auction sim: a true
